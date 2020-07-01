@@ -12,7 +12,7 @@
                                               :table          table
                                               :bucket         bucket
                                               :database       database
-                                              :consistent-key #{:kv}}))))
+                                              :consistent-key #{:kv-root}}))))
 
    :args     {::table    {:crux.config/required? true
                           :crux.config/type      :crux.config/string
