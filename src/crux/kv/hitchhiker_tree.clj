@@ -83,37 +83,33 @@
 ; So here we just make all keys and values byte arrays, and will turn
 ; them back into buffers later.
 
-(defrecord WrappedBytes [bytes]
+(defrecord WrappedBytes [buffer]
   n/IEDNOrderable
   (-order-on-edn-types [_] -10)
 
+  benc/PHashCoercion
+  (-coerce [_ md-create-fn write-handlers]
+    (if-let [bytes (when (zero? (.wrapAdjustment buffer)) (.byteArray buffer))]
+      (benc/-coerce bytes md-create-fn write-handlers)
+      (let [bytes (byte-array (.capacity buffer))]
+        (.getBytes buffer 0 bytes)
+        (benc/-coerce bytes md-create-fn write-handlers))))
+
   Comparable
   (compareTo [_ that]
-    (cond (not (bytes? (:bytes that)))
+    (cond (not (instance? DirectBuffer (:buffer that)))
           (throw (ClassCastException. (str "can't compare WrappedBytes to " (some-> that type pr-str))))
-
-          (< (alength bytes) (alength (:bytes that)))
-          -1
-
-          (> (alength bytes) (alength (:bytes that)))
-          1
-
-          :else
-          (reduce (fn [v [x y]]
-                    (if (zero? v)
-                      (Byte/compare x y)
-                      v))
-                  0 (map vector bytes (:bytes that))))))
+          :else (.compareTo buffer (:buffer that)))))
 
 (defn- buffer->bytes
-  [^DirectBuffer buffer]
-  (let [b (byte-array (.capacity buffer))]
-    (.getBytes buffer 0 b)
-    (->WrappedBytes b)))
+  [buffer]
+  (if (instance? DirectBuffer buffer)
+    (->WrappedBytes buffer)
+    buffer))
 
 (defn- bytes->buffer
-  [{:keys [bytes]}]
-  (UnsafeBuffer. ^"[B" bytes))
+  [{:keys [buffer]}]
+  buffer)
 
 (defrecord HitchhikerTreeKVIterator [snapshot cursor]
   kv/KvIterator
@@ -220,18 +216,21 @@
   (kv-name [_]
     "hitchhiker-tree"))
 
-(extend-protocol benc/PHashCoercion
-  DirectBuffer
-  (-coerce [this md-create-fn write-handlers]
-    (let [bout (ByteArrayOutputStream. (.capacity this))
-          bufin (DirectBufferInputStream. this)]
-      (io/copy bufin bout)
-      (let [bytes (.toByteArray bout)]
-        (benc/-coerce bytes md-create-fn write-handlers)))))
-
-(extend-protocol hitchhiker.tree.node/IEDNOrderable
-  DirectBuffer
-  (-order-on-edn-types [_] -10))
+(defn add-buffer-handlers
+  [store]
+  (swap! (:read-handlers store)
+         merge
+         {'crux.kv.hitchhiker_tree.WrappedBytes
+          (fn [{:keys [bytes]}]
+            (->WrappedBytes (UnsafeBuffer. ^"[B" bytes)))})
+  (swap! (:write-handlers store)
+         merge
+         {'crux.kv.hitchhiker_tree.WrappedBytes
+          (fn [{:keys [buffer]}]
+            (let [bytes (byte-array (.capacity buffer))]
+              (.getBytes buffer 0 bytes)
+              {:bytes bytes}))})
+  store)
 
 (def kv
   {:crux.node/kv-store {:start-fn (fn [{::keys [backend]} {::keys [index-buffer-size data-buffer-size op-buffer-size]}]
@@ -257,6 +256,8 @@
                         :deps     #{::backend}}
    ::backend           {:start-fn (fn [{::keys [konserve]} _]
                                     (log/debug "bootstrapping hh-tree backend with konserve:" konserve)
-                                    (hk/->KonserveBackend (hk/add-hitchhiker-tree-handlers konserve)))
+                                    (hk/->KonserveBackend (-> konserve
+                                                              (hk/add-hitchhiker-tree-handlers)
+                                                              (add-buffer-handlers))))
                         :deps     #{::konserve}}
    ::konserve          crux.kv.hitchhiker-tree.konserve.memory/memory-backend})
