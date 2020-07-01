@@ -1,4 +1,4 @@
-(defproject com.github.csm/crux-hitchhiker-tree "0.1.0-SNAPSHOT"
+(defproject com.github.csm/crux-hitchhiker-tree "0.1.0"
   :description "Crux KV store on hitchhiker-tree"
   :url "https://github.com/csm/crux-kv-hitchhiker-tree"
   :license {:name "MIT"
