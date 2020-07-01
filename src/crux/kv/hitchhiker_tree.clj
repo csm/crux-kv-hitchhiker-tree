@@ -199,7 +199,8 @@
       (ha/<?? (hh/flush-tree tree backend))
       (log/debug "flushed tree, writing root ID" (pr-str (-> tree :storage-addr async/poll! :konserve-key)))
       (async/<!! (k/assoc-in (:store backend) [:kv-root]
-                             (-> tree :storage-addr async/poll!)))))
+                             (-> tree :storage-addr async/poll!)))
+      nil))
 
   (compact [_]
     :todo)
