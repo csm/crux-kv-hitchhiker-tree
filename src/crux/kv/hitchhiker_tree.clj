@@ -1,13 +1,21 @@
 (ns crux.kv.hitchhiker-tree
-  (:require [crux.kv :as kv]
+  (:require [clojure.core.async :as async]
+            [clojure.java.io :as io]
+            [clojure.tools.logging :as log]
+            [crux.kv :as kv]
+            crux.kv.hitchhiker-tree.konserve.memory
+            [hasch.benc :as benc]
             [hitchhiker.tree :as hh]
+            [hitchhiker.tree.bootstrap.konserve :as hk]
             hitchhiker.tree.key-compare
-            [clojure.core.async :as async]
+            [hitchhiker.tree.node :as n]
             [hitchhiker.tree.utils.async :as ha]
-            [hitchhiker.tree.node :as n])
-  (:import (java.io Closeable)
-           (clojure.lang IDeref)
-           (java.util Collections Comparator)))
+            [konserve.cache :as k]
+            konserve.memory)
+  (:import (java.io Closeable ByteArrayOutputStream)
+           (org.agrona DirectBuffer)
+           (org.agrona.io DirectBufferInputStream)
+           (org.agrona.concurrent UnsafeBuffer)))
 
 (defn- left-successor
   [path]
@@ -100,7 +108,14 @@
     (->HitchhikerTreeKVIterator (volatile! this) (volatile! nil)))
 
   (get-value [_ k]
-    (hh/lookup-key @root k))
+    ; hh/lookup-key fails when you have an empty tree
+    (ha/<??
+      (ha/go-try
+        (some-> (ha/<? (hh/lookup-path @root k))
+                (peek)
+                (hh/<?-resolve)
+                :children
+                (get k)))))
 
   Closeable
   (close [_] (vreset! root nil)))
@@ -108,10 +123,11 @@
 (defrecord HitchhikerTreeKVStore [root backend]
   kv/KvStore
   (new-snapshot [_]
-    (->HitchhikerTreeKVSnapshot (volatile! @root)))
+    (let [r @root]
+      (->HitchhikerTreeKVSnapshot (volatile! r))))
 
   (store [_ kvs]
-    (swap! root (fn [root] (reduce-kv hh/insert root kvs))))
+    (swap! root (fn [root] (reduce (fn [tree [k v]] (hh/insert tree k v)) root kvs))))
 
   (delete [_ ks]
     (swap! root (fn [root] (reduce hh/delete root ks))))
@@ -130,7 +146,12 @@
     ; then march back through the graph until we find our closest common ancestor
     ; tree, then merge each successive tree with our tree, then attempt to
     ; write the merged root again (repeat as necessary).
-    (hh/flush-tree @root backend))
+    ; possibly only have one writer,
+    (let [tree @root]
+      (ha/<?? (hh/flush-tree tree backend))
+      (log/debug "flushed tree, writing root ID" (pr-str (-> tree :storage-addr async/poll!)))
+      (async/<!! (k/assoc-in (:store backend) [:kv :root]
+                             (-> tree :storage-addr async/poll!)))))
 
   (compact [_]
     :todo)
@@ -153,3 +174,41 @@
 
   (kv-name [_]
     "hitchhiker-tree"))
+
+(extend-protocol benc/PHashCoercion
+  DirectBuffer
+  (-coerce [this md-create-fn write-handlers]
+    (let [bout (ByteArrayOutputStream. (.capacity this))
+          bufin (DirectBufferInputStream. this)]
+      (io/copy bufin bout)
+      (let [bytes (.toByteArray bout)]
+        (benc/-coerce bytes md-create-fn write-handlers)))))
+
+(extend-protocol hitchhiker.tree.node/IEDNOrderable
+  DirectBuffer
+  (-order-on-edn-types [_] -10))
+
+(def kv
+  {:crux.node/kv-store {:start-fn (fn [{::keys [backend]} {::keys [index-buffer-size data-buffer-size op-buffer-size]}]
+                                    (let [root (if-let [root-address (async/<!! (k/get-in (:store backend) [:kv :root]))]
+                                                 (if (instance? Throwable root-address)
+                                                   (throw root-address)
+                                                   (ha/<?? (hk/create-tree-from-root-key (:store backend) root-address)))
+                                                 (ha/<?? (hh/b-tree (hh/->Config index-buffer-size data-buffer-size op-buffer-size))))]
+                                      (log/debug "resolved root node: " root)
+                                      (->HitchhikerTreeKVStore (atom root) backend)))
+                        :args     {::index-buffer-size {:doc              "Size of each index node"
+                                                        :default          32
+                                                        :crux.config/type :crux.config/nat-int}
+                                   ::data-buffer-size  {:doc              "Size of each data node"
+                                                        :default          64
+                                                        :crux.config/type :crux.config/nat-int}
+                                   ::op-buffer-size    {:doc              "Size of each op buffer"
+                                                        :default          128
+                                                        :crux.config/type :crux.config/nat-int}}
+                        :deps     #{::backend}}
+   ::backend           {:start-fn (fn [{::keys [konserve]} _]
+                                    (log/debug "bootstrapping hh-tree backend with konserve:" konserve)
+                                    (hk/->KonserveBackend (hk/add-hitchhiker-tree-handlers konserve)))
+                        :deps     #{::konserve}}
+   ::konserve          crux.kv.hitchhiker-tree.konserve.memory/memory-backend})
