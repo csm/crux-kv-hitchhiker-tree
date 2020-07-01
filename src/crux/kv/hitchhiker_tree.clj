@@ -157,8 +157,9 @@
     (->HitchhikerTreeKVIterator (volatile! this) (volatile! nil)))
 
   (get-value [_ k]
-    (ha/<??
-      (hm/lookup @root (buffer->bytes k))))
+    (some-> (ha/<??
+              (hm/lookup @root (buffer->bytes k)))
+            (bytes->buffer)))
 
   Closeable
   (close [_] (vreset! root nil)))
