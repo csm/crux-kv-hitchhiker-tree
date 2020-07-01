@@ -8,10 +8,12 @@
             [hitchhiker.tree :as hh]
             [hitchhiker.tree.bootstrap.konserve :as hk]
             hitchhiker.tree.key-compare
+            [hitchhiker.tree.messaging :as hm]
             [hitchhiker.tree.node :as n]
             [hitchhiker.tree.utils.async :as ha]
             [konserve.cache :as k]
-            konserve.memory)
+            konserve.memory
+            [hitchhiker.tree.key-compare :as c])
   (:import (java.io Closeable ByteArrayOutputStream)
            (org.agrona DirectBuffer)
            (org.agrona.io DirectBufferInputStream)
@@ -49,24 +51,24 @@
 
 (defn- reverse-iterator
   [path end-key inclusive?]
-  (let [start-node (peek path)]
-    (assert (hh/data-node? start-node))
-    (let [last-elements (-> start-node
-                            :children
-                            (subseq (if inclusive? <= <) end-key)
-                            (reverse))
-          prev-elements (lazy-seq
-                          (when-let [succ (left-successor (pop path))]
-                            (reverse-iterator succ end-key inclusive?)))]
-      (concat last-elements prev-elements))))
+  (assert (hh/data-node? (peek path)))
+  (let [last-elements (reverse (hm/apply-ops-in-path path))
+        prev-elements (lazy-seq
+                        (when-let [succ (left-successor (pop path))]
+                          (reverse-iterator succ end-key inclusive?)))]
+    (concat last-elements prev-elements)))
 
 (defn- lookup-rev-iter
   [tree key inclusive?]
-  (let [path (hh/lookup-path tree key)]
+  (let [path (hh/lookup-path tree key)
+        accept? (if inclusive?
+                  #(pos? (c/-compare % key))
+                  #(not (neg? (c/-compare % key))))]
     (when path
-      (reverse-iterator path key inclusive?))))
+      (drop-while (fn [[k v]] (accept? k))
+        (reverse-iterator path key inclusive?)))))
 
-(defn- compare-and-set!
+(defn- cas!
   [store ks expect new]
   (k/update-in store ks (fn [current]
                           (if (not= current expect)
@@ -126,7 +128,7 @@
                                  (fn [{:keys [iter forward] :as cursor}]
                                    (if (true? forward)
                                      (assoc cursor :iter (next iter))
-                                     (assoc cursor :iter (next (hh/lookup-fwd-iter @(:root @snapshot)
+                                     (assoc cursor :iter (next (hm/lookup-fwd-iter @(:root @snapshot)
                                                                                    (some-> iter first key)))
                                                    :forward true))))]
       (some-> iter first key bytes->buffer)))
@@ -155,15 +157,8 @@
     (->HitchhikerTreeKVIterator (volatile! this) (volatile! nil)))
 
   (get-value [_ k]
-    ; hh/lookup-key fails when you have an empty tree
     (ha/<??
-      (ha/go-try
-        (some-> (ha/<? (hh/lookup-path @root (buffer->bytes k)))
-                (peek)
-                (hh/<?-resolve)
-                :children
-                (get k)
-                (bytes->buffer)))))
+      (hm/lookup @root (buffer->bytes k))))
 
   Closeable
   (close [_] (vreset! root nil)))
@@ -175,10 +170,10 @@
       (->HitchhikerTreeKVSnapshot (volatile! r))))
 
   (store [_ kvs]
-    (swap! root (fn [root] (reduce (fn [tree [k v]] (hh/insert tree (buffer->bytes k) (buffer->bytes v))) root kvs))))
+    (swap! root (fn [root] (reduce (fn [tree [k v]] (hm/insert tree (buffer->bytes k) (buffer->bytes v))) root kvs))))
 
   (delete [_ ks]
-    (swap! root (fn [root] (reduce hh/delete root (map buffer->bytes ks)))))
+    (swap! root (fn [root] (reduce hm/delete root (map buffer->bytes ks)))))
 
   (fsync [_]
     ; todo we may want to do a merge step here, so concurrent updates
@@ -199,7 +194,7 @@
       (ha/<?? (hh/flush-tree tree backend))
       (log/debug "flushed tree, writing root ID" (pr-str (-> tree :storage-addr async/poll! :konserve-key)))
       (async/<!! (k/assoc-in (:store backend) [:kv-root]
-                             (-> tree :storage-addr async/poll!)))
+                             (-> tree :storage-addr async/poll! :konserve-key)))
       nil))
 
   (compact [_]
@@ -240,10 +235,14 @@
 (def kv
   {:crux.node/kv-store {:start-fn (fn [{::keys [backend]} {::keys [index-buffer-size data-buffer-size op-buffer-size]}]
                                     (let [root (if-let [root-address (async/<!! (k/get-in (:store backend) [:kv :root]))]
-                                                 (if (instance? Throwable root-address)
-                                                   (throw root-address)
-                                                   (ha/<?? (hk/create-tree-from-root-key (:store backend) root-address)))
-                                                 (ha/<?? (hh/b-tree (hh/->Config index-buffer-size data-buffer-size op-buffer-size))))]
+                                                 (do
+                                                   (log/info "loading tree from root address:" root-address)
+                                                   (if (instance? Throwable root-address)
+                                                     (throw root-address)
+                                                     (ha/<?? (hk/create-tree-from-root-key (:store backend) root-address))))
+                                                 (do
+                                                   (log/info "creating empty tree with config:" index-buffer-size data-buffer-size op-buffer-size)
+                                                   (ha/<?? (hh/b-tree (hh/->Config index-buffer-size data-buffer-size op-buffer-size)))))]
                                       (->HitchhikerTreeKVStore (atom root) backend)))
                         :args     {::index-buffer-size {:doc              "Size of each index node"
                                                         :default          32
