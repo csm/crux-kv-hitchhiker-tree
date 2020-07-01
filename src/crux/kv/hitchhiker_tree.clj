@@ -216,6 +216,18 @@
   (kv-name [_]
     "hitchhiker-tree"))
 
+(defmethod print-method HitchhikerTreeKVIterator
+  [_ writer]
+  (.write writer "#crux.kv.hitchhiker-tree/HitchhikerTreeKVIterator{}"))
+
+(defmethod print-method HitchhikerTreeKVSnapshot
+  [_ writer]
+  (.write writer "#crux.kv.hitchhiker-tree/HitchhikerTreeKVSnapshot{}"))
+
+(defmethod print-method HitchhikerTreeKVStore
+  [_ writer]
+  (.write writer "#crux.kv.hitchhiker-tree/HitchhikerTreeKVStore{}"))
+
 (defn add-buffer-handlers
   [store]
   (swap! (:read-handlers store)
