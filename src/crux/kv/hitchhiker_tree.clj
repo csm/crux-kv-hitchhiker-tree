@@ -66,13 +66,60 @@
     (when path
       (reverse-iterator path key inclusive?))))
 
+(defn- compare-and-set!
+  [store ks expect new]
+  (k/update-in store ks (fn [current]
+                          (if (not= current expect)
+                            (throw (IllegalStateException. "compare-and-set! test failed"))
+                            new))))
+
+; If we just add agrona buffers to the tree, we can't recover them
+; once they're inside incognito values; it seems like the fressian
+; deserialization for incognito doesn't properly deserialize members,
+; even if our serializer has the right read handlers (in the end, we
+; just get a fressian TaggedObject, not the reconstituted agrona buffer).
+; So here we just make all keys and values byte arrays, and will turn
+; them back into buffers later.
+
+(defrecord WrappedBytes [bytes]
+  n/IEDNOrderable
+  (-order-on-edn-types [_] -10)
+
+  Comparable
+  (compareTo [_ that]
+    (cond (not (bytes? (:bytes that)))
+          (throw (ClassCastException. (str "can't compare WrappedBytes to " (some-> that type pr-str))))
+
+          (< (alength bytes) (alength (:bytes that)))
+          -1
+
+          (> (alength bytes) (alength (:bytes that)))
+          1
+
+          :else
+          (reduce (fn [v [x y]]
+                    (if (zero? v)
+                      (Byte/compare x y)
+                      v))
+                  0 (map vector bytes (:bytes that))))))
+
+(defn- buffer->bytes
+  [^DirectBuffer buffer]
+  (let [b (byte-array (.capacity buffer))]
+    (.getBytes buffer 0 b)
+    (->WrappedBytes b)))
+
+(defn- bytes->buffer
+  [{:keys [bytes]}]
+  (UnsafeBuffer. ^"[B" bytes))
+
 (defrecord HitchhikerTreeKVIterator [snapshot cursor]
   kv/KvIterator
   (seek [_ k]
     (let [{:keys [iter]} (vswap! cursor assoc
-                                 :iter (hh/lookup-fwd-iter @(:root @snapshot) k)
+                                 :iter (hh/lookup-fwd-iter @(:root @snapshot) (buffer->bytes k))
                                  :forward true)]
-      (some-> iter first key)))
+      (some-> iter first key bytes->buffer)))
 
   (next [this]
     (let [{:keys [iter]} (vswap! cursor
@@ -82,7 +129,7 @@
                                      (assoc cursor :iter (next (hh/lookup-fwd-iter @(:root @snapshot)
                                                                                    (some-> iter first key)))
                                                    :forward true))))]
-      (some-> iter first key)))
+      (some-> iter first key bytes->buffer)))
 
   (prev [_]
     (let [{:keys [iter]} (vswap! cursor
@@ -94,10 +141,10 @@
                                                                               (n/-last-key @(:root @snapshot)))
                                                                           (nil? (some-> iter first key)))
                                                    :forward false))))]
-      (some-> iter first key)))
+      (some-> iter first key bytes->buffer)))
 
   (value [_]
-    (some-> @cursor :iter first (val)))
+    (some-> @cursor :iter first (val) bytes->buffer))
 
   Closeable
   (close [_] (vreset! snapshot nil)))
@@ -111,11 +158,12 @@
     ; hh/lookup-key fails when you have an empty tree
     (ha/<??
       (ha/go-try
-        (some-> (ha/<? (hh/lookup-path @root k))
+        (some-> (ha/<? (hh/lookup-path @root (buffer->bytes k)))
                 (peek)
                 (hh/<?-resolve)
                 :children
-                (get k)))))
+                (get k)
+                (bytes->buffer)))))
 
   Closeable
   (close [_] (vreset! root nil)))
@@ -127,10 +175,10 @@
       (->HitchhikerTreeKVSnapshot (volatile! r))))
 
   (store [_ kvs]
-    (swap! root (fn [root] (reduce (fn [tree [k v]] (hh/insert tree k v)) root kvs))))
+    (swap! root (fn [root] (reduce (fn [tree [k v]] (hh/insert tree (buffer->bytes k) (buffer->bytes v))) root kvs))))
 
   (delete [_ ks]
-    (swap! root (fn [root] (reduce hh/delete root ks))))
+    (swap! root (fn [root] (reduce hh/delete root (map buffer->bytes ks)))))
 
   (fsync [_]
     ; todo we may want to do a merge step here, so concurrent updates
@@ -149,8 +197,8 @@
     ; possibly only have one writer,
     (let [tree @root]
       (ha/<?? (hh/flush-tree tree backend))
-      (log/debug "flushed tree, writing root ID" (pr-str (-> tree :storage-addr async/poll!)))
-      (async/<!! (k/assoc-in (:store backend) [:kv :root]
+      (log/debug "flushed tree, writing root ID" (pr-str (-> tree :storage-addr async/poll! :konserve-key)))
+      (async/<!! (k/assoc-in (:store backend) [:kv-root]
                              (-> tree :storage-addr async/poll!)))))
 
   (compact [_]
@@ -195,7 +243,6 @@
                                                    (throw root-address)
                                                    (ha/<?? (hk/create-tree-from-root-key (:store backend) root-address)))
                                                  (ha/<?? (hh/b-tree (hh/->Config index-buffer-size data-buffer-size op-buffer-size))))]
-                                      (log/debug "resolved root node: " root)
                                       (->HitchhikerTreeKVStore (atom root) backend)))
                         :args     {::index-buffer-size {:doc              "Size of each index node"
                                                         :default          32
